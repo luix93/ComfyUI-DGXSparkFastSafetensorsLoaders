@@ -45,12 +45,13 @@ Restart ComfyUI. The nodes appear in the **loaders** category.
 
 ## Notes
 
-- Tested with `--disable-mmap` and `--gpu-only` flags, though they might be unnecessary.
+- Tested with `--disable-mmap` and `--gpu-only` flags, though they might be unnecessary and irrelevant.
+- Should support quantized model compared to Phaserblast's implementation. If you encounter any problem, please raise an issue.
 
 ## Known Issues
 
-- All loaders except Safetensor Loader will double the memory usage. But they do significantly reduce the model loading time.
+- ~~All loaders except Safetensor Loader will double the memory usage. But they do significantly reduce the model loading time.~~ Fixed.
 
 ## Acknowledgements
 
-Original node by [Phaserblast](https://github.com/phaserblast) — [ComfyUI-DGXSparkSafetensorsLoader](https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader), licensed under the Apache License 2.0.
+Original `DGXSparkSafetensorsLoader` node and idea by [Phaserblast](https://github.com/phaserblast) — [ComfyUI-DGXSparkSafetensorsLoader](https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader), licensed under the Apache License 2.0.
