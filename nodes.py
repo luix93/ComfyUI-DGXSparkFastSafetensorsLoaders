@@ -17,7 +17,7 @@ import comfy.model_management
 import comfy.sd
 
 # https://github.com/foundation-model-stack/fastsafetensors
-from fastsafetensors import fastsafe_open,SafeTensorsFileLoader,SingleGroup
+from fastsafetensors import fastsafe_open, SafeTensorsFileLoader, SingleGroup
 
 # ---------------------------------------------------------------------------
 # Global registry tracking every model loaded by a DGX Spark node.
@@ -52,12 +52,12 @@ def _clear_nn_params(module):
     so that all references to fastsafetensors memory are broken."""
     for _name, param in list(module.named_parameters()):
         try:
-            param.data = torch.empty(0, device='cpu')
+            param.data = torch.empty(0, device="cpu")
         except Exception:
             pass
     for _name, buf in list(module.named_buffers()):
         try:
-            buf.data = torch.empty(0, device='cpu')
+            buf.data = torch.empty(0, device="cpu")
         except Exception:
             pass
 
@@ -70,7 +70,7 @@ def _remove_from_comfyui(patchers):
         lm = loaded.model
         if lm is None:
             continue
-        if id(lm) in patcher_set or id(getattr(lm, 'parent', None)) in patcher_set:
+        if id(lm) in patcher_set or id(getattr(lm, "parent", None)) in patcher_set:
             to_remove.append(i)
     for i in reversed(to_remove):
         try:
@@ -97,21 +97,23 @@ def _cleanup_model(key):
 
     # 2. Wipe tensor data in every tracked nn.Module
     for obj in patchers:
-        model = getattr(obj, 'model', None)
+        model = getattr(obj, "model", None)
         if model is None:
             continue
         # Diffusion model (UNet / DiT)
-        dm = getattr(model, 'diffusion_model', None)
+        dm = getattr(model, "diffusion_model", None)
         if dm is not None:
             _clear_nn_params(dm)
         # CLIP text encoder
-        csm = getattr(obj, 'cond_stage_model', None)
+        csm = getattr(obj, "cond_stage_model", None)
         if csm is None:
             csm = model  # the patcher.model could be the TE itself
-        if csm is not None and hasattr(csm, 'named_parameters'):
+        if csm is not None and hasattr(csm, "named_parameters"):
             _clear_nn_params(csm)
         # VAE
-        fsm = getattr(model, 'first_stage_model', None) or getattr(obj, 'first_stage_model', None)
+        fsm = getattr(model, "first_stage_model", None) or getattr(
+            obj, "first_stage_model", None
+        )
         if fsm is not None:
             _clear_nn_params(fsm)
 
@@ -136,16 +138,26 @@ def _cleanup_model(key):
 #  Loader nodes
 # ===================================================================
 
+
 class DGXSparkSafetensorsLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "The filename of the .safetensors model to load."}),
-                "device": (["cuda:0"],{"default": "cuda:0", "tooltip": "The device to which the model will be copied."}),
+                "model_name": (
+                    folder_paths.get_filename_list("diffusion_models"),
+                    {"tooltip": "The filename of the .safetensors model to load."},
+                ),
+                "device": (
+                    ["cuda:0"],
+                    {
+                        "default": "cuda:0",
+                        "tooltip": "The device to which the model will be copied.",
+                    },
+                ),
             }
         }
-        
+
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
@@ -168,15 +180,19 @@ class DGXSparkSafetensorsLoader:
 
         dev = torch.device(device)
         model_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
-        
+
         sd, metadata, fb, loader = _fastsafe_load(model_path, device)
 
         # Init the model to pass to ComfyUI
         diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(sd)
-        temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
+        temp_sd = comfy.utils.state_dict_prefix_replace(
+            sd, {diffusion_model_prefix: ""}, filter_keys=True
+        )
         if len(temp_sd) > 0:
             sd = temp_sd
-        model_config = comfy.model_detection.model_config_from_unet(sd, "", metadata=metadata)
+        model_config = comfy.model_detection.model_config_from_unet(
+            sd, "", metadata=metadata
+        )
         if model_config is None:
             fb.close()
             loader.close()
@@ -184,12 +200,14 @@ class DGXSparkSafetensorsLoader:
         model_dtype = comfy.utils.weight_dtype(sd, "")
         model_config.set_inference_dtype(model_dtype, torch.bfloat16)
         model = model_config.get_model(sd, "", device=None)
-        
+
         model = model.to(None)
         sd = model_config.process_unet_state_dict(sd)
         model.diffusion_model.load_state_dict(sd, strict=False, assign=True)
-        
-        model_patcher = comfy.model_patcher.ModelPatcher(model, load_device=dev, offload_device=None)
+
+        model_patcher = comfy.model_patcher.ModelPatcher(
+            model, load_device=dev, offload_device=None
+        )
 
         _load_counter += 1
         _dgx_registry[key] = {
@@ -207,13 +225,19 @@ class DGXSparkCheckpointLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {
-                    "tooltip": "The name of the checkpoint to load.",
-                }),
-                "device": (["cuda:0"], {
-                    "default": "cuda:0",
-                    "tooltip": "The device to load to.",
-                }),
+                "ckpt_name": (
+                    folder_paths.get_filename_list("checkpoints"),
+                    {
+                        "tooltip": "The name of the checkpoint to load.",
+                    },
+                ),
+                "device": (
+                    ["cuda:0"],
+                    {
+                        "default": "cuda:0",
+                        "tooltip": "The device to load to.",
+                    },
+                ),
             }
         }
 
@@ -284,17 +308,42 @@ class DGXSparkCLIPLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "clip_name": (folder_paths.get_filename_list("text_encoders"), {
-                    "tooltip": "The CLIP / text encoder model to load.",
-                }),
-                "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio",
-                          "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan",
-                          "hidream", "chroma", "ace", "omnigen2", "qwen_image",
-                          "hunyuan_image", "flux2", "ovis", "longcat_image"], ),
-                "device": (["cuda:0"], {
-                    "default": "cuda:0",
-                    "tooltip": "The device to load to. On DGX Spark, always use cuda:0 (unified memory).",
-                }),
+                "clip_name": (
+                    folder_paths.get_filename_list("text_encoders"),
+                    {
+                        "tooltip": "The CLIP / text encoder model to load.",
+                    },
+                ),
+                "type": (
+                    [
+                        "stable_diffusion",
+                        "stable_cascade",
+                        "sd3",
+                        "stable_audio",
+                        "mochi",
+                        "ltxv",
+                        "pixart",
+                        "cosmos",
+                        "lumina2",
+                        "wan",
+                        "hidream",
+                        "chroma",
+                        "ace",
+                        "omnigen2",
+                        "qwen_image",
+                        "hunyuan_image",
+                        "flux2",
+                        "ovis",
+                        "longcat_image",
+                    ],
+                ),
+                "device": (
+                    ["cuda:0"],
+                    {
+                        "default": "cuda:0",
+                        "tooltip": "The device to load to. On DGX Spark, always use cuda:0 (unified memory).",
+                    },
+                ),
             }
         }
 
@@ -322,9 +371,13 @@ class DGXSparkCLIPLoader:
         sd, metadata, fb, loader = _fastsafe_load(clip_path, device)
 
         # Convert old quant formats
-        sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
+        sd, metadata = comfy.utils.convert_old_quants(
+            sd, model_prefix="", metadata=metadata
+        )
 
-        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        clip_type = getattr(
+            comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION
+        )
 
         clip = comfy.sd.load_text_encoder_state_dicts(
             state_dicts=[sd],
@@ -349,13 +402,19 @@ class DGXSparkVAELoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "vae_name": (folder_paths.get_filename_list("vae"), {
-                    "tooltip": "The VAE model to load.",
-                }),
-                "device": (["cuda:0"], {
-                    "default": "cuda:0",
-                    "tooltip": "The device to load to.",
-                }),
+                "vae_name": (
+                    folder_paths.get_filename_list("vae"),
+                    {
+                        "tooltip": "The VAE model to load.",
+                    },
+                ),
+                "device": (
+                    ["cuda:0"],
+                    {
+                        "default": "cuda:0",
+                        "tooltip": "The device to load to.",
+                    },
+                ),
             }
         }
 
@@ -401,6 +460,7 @@ class DGXSparkVAELoader:
 #  Unloader node
 # ===================================================================
 
+
 def _loaded_model_choices():
     """Return a list of currently loaded registry keys for the COMBO widget.
     Always includes a stable placeholder so stale frontend values never
@@ -420,21 +480,30 @@ class DGXSparkUnloader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "confirm": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Safety toggle. Must be True to unload. When False the node is a no-op.",
-                }),
-                "mode": (["all", "selected"], {
-                    "default": "all",
-                    "tooltip": "'all' unloads every model loaded by any DGX Spark loader. 'selected' unloads only the model chosen in 'target'.",
-                }),
+                "confirm": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Safety toggle. Must be True to unload. When False the node is a no-op.",
+                    },
+                ),
+                "mode": (
+                    ["all", "selected"],
+                    {
+                        "default": "all",
+                        "tooltip": "'all' unloads every model loaded by any DGX Spark loader. 'selected' unloads only the model chosen in 'target'.",
+                    },
+                ),
             },
             "optional": {
-                "target": (_loaded_model_choices(), {
-                    "default": "(none)",
-                    "tooltip": "The model to unload (only used when mode is 'selected'). Refresh the page to update this list after loading models.",
-                }),
-            }
+                "target": (
+                    _loaded_model_choices(),
+                    {
+                        "default": "(none)",
+                        "tooltip": "The model to unload (only used when mode is 'selected'). Refresh the page to update this list after loading models.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ()
@@ -455,7 +524,11 @@ class DGXSparkUnloader:
 
     def unload_model(self, confirm, mode, target="(none)"):
         loaded = sorted(_dgx_registry.keys())
-        status_line = f"Currently loaded ({len(loaded)}): {', '.join(loaded)}" if loaded else "No models loaded."
+        status_line = (
+            f"Currently loaded ({len(loaded)}): {', '.join(loaded)}"
+            if loaded
+            else "No models loaded."
+        )
 
         if not confirm:
             return {"ui": {"text": [status_line, "Action: none (confirm is False)"]}}
@@ -466,16 +539,32 @@ class DGXSparkUnloader:
             count = len(loaded)
             for k in loaded:
                 _cleanup_model(k)
-            return {"ui": {"text": [f"Unloaded {count} model(s): {', '.join(loaded)}",
-                                     "Tip: set confirm back to False before next run."]}}
+            return {
+                "ui": {
+                    "text": [
+                        f"Unloaded {count} model(s): {', '.join(loaded)}",
+                        "Tip: set confirm back to False before next run.",
+                    ]
+                }
+            }
 
         # mode == "selected"
         if target in _dgx_registry:
             _cleanup_model(target)
             remaining = sorted(_dgx_registry.keys())
-            remain_line = f"Still loaded ({len(remaining)}): {', '.join(remaining)}" if remaining else "No models remain."
-            return {"ui": {"text": [f"Unloaded: {target}", remain_line,
-                                     "Tip: set confirm back to False before next run."]}}
+            remain_line = (
+                f"Still loaded ({len(remaining)}): {', '.join(remaining)}"
+                if remaining
+                else "No models remain."
+            )
+            return {
+                "ui": {
+                    "text": [
+                        f"Unloaded: {target}",
+                        remain_line,
+                        "Tip: set confirm back to False before next run.",
+                    ]
+                }
+            }
 
         return {"ui": {"text": [status_line, f"Target not found: {target}"]}}
-
