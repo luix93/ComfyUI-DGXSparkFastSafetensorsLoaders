@@ -394,10 +394,20 @@ class DGXSparkVAELoader:
 #  Unloader node
 # ===================================================================
 
+def _loaded_model_choices():
+    """Return a list of currently loaded registry keys for the COMBO widget.
+    Always includes a stable placeholder so stale frontend values never
+    fail server-side validation."""
+    return ["(none)"] + sorted(_dgx_registry.keys())
+
+
 class DGXSparkUnloader:
     """Frees GPU/RAM memory for models loaded by any DGX Spark loader node.
     Set 'confirm' to True and queue the workflow (or click play) to unload.
-    Safe no-op when confirm is False."""
+    Safe no-op when confirm is False.
+
+    The 'target' dropdown lists models currently held by DGX Spark loaders.
+    Refresh the browser page to update the list after loading new models."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -405,19 +415,17 @@ class DGXSparkUnloader:
             "required": {
                 "confirm": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Safety toggle. Set to True to actually unload. When False the node does nothing, so normal workflow runs are safe.",
+                    "tooltip": "Safety toggle. Must be True to unload. When False the node is a no-op.",
                 }),
-                "mode": (["selected", "all"], {
-                    "default": "selected",
-                    "tooltip": "'selected' unloads only the chosen model. 'all' unloads every model loaded by any DGX Spark loader.",
+                "mode": (["all", "selected"], {
+                    "default": "all",
+                    "tooltip": "'all' unloads every model loaded by any DGX Spark loader. 'selected' unloads only the model chosen in 'target'.",
                 }),
-                "category": (["diffusion_models", "checkpoints", "text_encoders", "vae"], {
-                    "default": "diffusion_models",
-                    "tooltip": "The category of the model to unload (only used when mode is 'selected').",
-                }),
-                "model_name": ("STRING", {
-                    "default": "",
-                    "tooltip": "Exact filename of the model to unload (only used when mode is 'selected'). Must match the name used when loading.",
+            },
+            "optional": {
+                "target": (_loaded_model_choices(), {
+                    "default": "(none)",
+                    "tooltip": "The model to unload (only used when mode is 'selected'). Refresh the page to update this list after loading models.",
                 }),
             }
         }
@@ -429,27 +437,38 @@ class DGXSparkUnloader:
     DESCRIPTION = "Frees GPU/RAM memory for models loaded by DGX Spark loaders. Set 'confirm' to True and queue to trigger. Safe no-op when confirm is False."
 
     @classmethod
-    def IS_CHANGED(cls, confirm, mode, category, model_name):
+    def IS_CHANGED(cls, confirm, mode, target="(none)"):
         if not confirm:
+            return False
+        if mode == "all" and not _dgx_registry:
+            return False
+        if mode == "selected" and target not in _dgx_registry:
             return False
         return float("nan")
 
-    def unload_model(self, confirm, mode, category, model_name):
+    def unload_model(self, confirm, mode, target="(none)"):
+        loaded = sorted(_dgx_registry.keys())
+        status_line = f"Currently loaded ({len(loaded)}): {', '.join(loaded)}" if loaded else "No models loaded."
+
         if not confirm:
-            return {"ui": {"text": ["Skipped (confirm is False)"]}}
+            return {"ui": {"text": [status_line, "Action: none (confirm is False)"]}}
 
         if mode == "all":
-            names = list(_dgx_registry.keys())
-            if not names:
-                return {"ui": {"text": ["No models loaded via DGX Spark loaders."]}}
-            for k in names:
+            if not loaded:
+                return {"ui": {"text": [status_line, "Nothing to unload."]}}
+            count = len(loaded)
+            for k in loaded:
                 _cleanup_model(k)
-            return {"ui": {"text": [f"Unloaded {len(names)} model(s): {', '.join(names)}"]}}
+            return {"ui": {"text": [f"Unloaded {count} model(s): {', '.join(loaded)}",
+                                     "Tip: set confirm back to False before next run."]}}
 
         # mode == "selected"
-        key = _registry_key(category, model_name)
-        if key in _dgx_registry:
-            _cleanup_model(key)
-            return {"ui": {"text": [f"Unloaded: {key}"]}}
-        return {"ui": {"text": [f"Not loaded: {key}"]}}
+        if target in _dgx_registry:
+            _cleanup_model(target)
+            remaining = sorted(_dgx_registry.keys())
+            remain_line = f"Still loaded ({len(remaining)}): {', '.join(remaining)}" if remaining else "No models remain."
+            return {"ui": {"text": [f"Unloaded: {target}", remain_line,
+                                     "Tip: set confirm back to False before next run."]}}
+
+        return {"ui": {"text": [status_line, f"Target not found: {target}"]}}
 
