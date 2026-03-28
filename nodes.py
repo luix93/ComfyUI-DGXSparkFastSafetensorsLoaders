@@ -7,79 +7,127 @@ import torch
 import folder_paths
 import comfy
 import comfy.model_management
+import comfy.sd
 
 # https://github.com/foundation-model-stack/fastsafetensors
 from fastsafetensors import fastsafe_open,SafeTensorsFileLoader,SingleGroup
 
-# Global registry tracking models loaded by DGXSparkSafetensorsLoader.
-# Keyed by model_name, stores fastsafetensors handles and the ModelPatcher.
+# ---------------------------------------------------------------------------
+# Global registry tracking every model loaded by a DGX Spark node.
+# key   = "<category>:<filename>"  (e.g. "diffusion_models:flux-dev.safetensors")
+# value = {fb, loader, objects, load_id}
+#   objects  – list of ModelPatcher-like objects whose params reference fb
+# ---------------------------------------------------------------------------
 _dgx_registry = {}
 _load_counter = 0
 
 
-def _cleanup_model(model_name):
-    """Free all memory for a model loaded by DGXSparkSafetensorsLoader."""
-    if model_name not in _dgx_registry:
-        return False
+def _registry_key(category, name):
+    return f"{category}:{name}"
 
-    entry = _dgx_registry.pop(model_name)
-    model_patcher = entry["model_patcher"]
-    fb = entry["fb"]
-    loader_ref = entry["loader"]
 
-    # Remove from ComfyUI's current_loaded_models so it doesn't track a dead model
+def _fastsafe_load(file_path, device):
+    """Load a .safetensors file with fastsafetensors, returning (sd, metadata, fb, loader).
+    The caller MUST keep fb and loader alive as long as the tensors are in use."""
+    dev = torch.device(device)
+    loader = SafeTensorsFileLoader(SingleGroup(), dev)
+    loader.add_filenames({0: [file_path]})
+    metadata = loader.meta[file_path][0].metadata or {}
+    fb = loader.copy_files_to_device()
+    sd = {}
+    for k in fb.key_to_rank_lidx.keys():
+        sd[k] = fb.get_tensor(k)
+    return sd, metadata, fb, loader
+
+
+def _clear_nn_params(module):
+    """Replace every parameter/buffer in *module* with an empty CPU tensor
+    so that all references to fastsafetensors memory are broken."""
+    for _name, param in list(module.named_parameters()):
+        try:
+            param.data = torch.empty(0, device='cpu')
+        except Exception:
+            pass
+    for _name, buf in list(module.named_buffers()):
+        try:
+            buf.data = torch.empty(0, device='cpu')
+        except Exception:
+            pass
+
+
+def _remove_from_comfyui(patchers):
+    """Remove the given ModelPatcher objects from ComfyUI's loaded-model list."""
+    patcher_set = set(id(p) for p in patchers)
     to_remove = []
     for i, loaded in enumerate(comfy.model_management.current_loaded_models):
-        lm_model = loaded.model
-        if lm_model is None:
+        lm = loaded.model
+        if lm is None:
             continue
-        # Match direct reference or clones whose parent is our model
-        if lm_model is model_patcher or getattr(lm_model, 'parent', None) is model_patcher:
+        if id(lm) in patcher_set or id(getattr(lm, 'parent', None)) in patcher_set:
             to_remove.append(i)
     for i in reversed(to_remove):
         try:
-            lm = comfy.model_management.current_loaded_models[i]
-            if lm.model_finalizer is not None:
-                lm.model_finalizer.detach()
-                lm.model_finalizer = None
-            lm.real_model = None
+            entry = comfy.model_management.current_loaded_models[i]
+            if entry.model_finalizer is not None:
+                entry.model_finalizer.detach()
+                entry.model_finalizer = None
+            entry.real_model = None
         except Exception:
             pass
         comfy.model_management.current_loaded_models.pop(i)
 
-    # Clear model parameters first to release references to fastsafetensors buffers.
-    # The tensors are views into the fastsafetensors file buffer, so we must break
-    # all references before closing fb.
-    if hasattr(model_patcher, 'model') and model_patcher.model is not None:
-        if hasattr(model_patcher.model, 'diffusion_model'):
-            for name, param in list(model_patcher.model.diffusion_model.named_parameters()):
-                try:
-                    param.data = torch.empty(0, device='cpu')
-                except Exception:
-                    pass
-            for name, buf in list(model_patcher.model.diffusion_model.named_buffers()):
-                try:
-                    buf.data = torch.empty(0, device='cpu')
-                except Exception:
-                    pass
 
-    # Close fastsafetensors handles (frees underlying GPU memory)
-    try:
-        fb.close()
-    except Exception:
-        pass
-    try:
-        loader_ref.close()
-    except Exception:
-        pass
+def _cleanup_model(key):
+    """Free all memory for a model tracked under *key* in the registry."""
+    if key not in _dgx_registry:
+        return False
 
-    del entry, model_patcher, fb, loader_ref
+    entry = _dgx_registry.pop(key)
+    patchers = entry.get("objects", [])
+
+    # 1. Remove from ComfyUI tracking
+    _remove_from_comfyui(patchers)
+
+    # 2. Wipe tensor data in every tracked nn.Module
+    for obj in patchers:
+        model = getattr(obj, 'model', None)
+        if model is None:
+            continue
+        # Diffusion model (UNet / DiT)
+        dm = getattr(model, 'diffusion_model', None)
+        if dm is not None:
+            _clear_nn_params(dm)
+        # CLIP text encoder
+        csm = getattr(obj, 'cond_stage_model', None)
+        if csm is None:
+            csm = model  # the patcher.model could be the TE itself
+        if csm is not None and hasattr(csm, 'named_parameters'):
+            _clear_nn_params(csm)
+        # VAE
+        fsm = getattr(model, 'first_stage_model', None) or getattr(obj, 'first_stage_model', None)
+        if fsm is not None:
+            _clear_nn_params(fsm)
+
+    # 3. Release fastsafetensors GPU memory
+    for h in ("fb", "loader"):
+        handle = entry.get(h)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    del entry, patchers
     gc.collect()
     torch.cuda.empty_cache()
 
-    logging.info(f"[DGXSpark] Unloaded model: {model_name}")
+    logging.info(f"[DGXSpark] Unloaded: {key}")
     return True
 
+
+# ===================================================================
+#  Loader nodes
+# ===================================================================
 
 class DGXSparkSafetensorsLoader:
     @classmethod
@@ -95,91 +143,261 @@ class DGXSparkSafetensorsLoader:
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
     CATEGORY = "loaders"
-    DESCRIPTION = "Loads a .safetensors file directly into memory using NVIDIA GPUDirect on DGX Spark."
+    DESCRIPTION = "Loads a diffusion model .safetensors file directly into memory using NVIDIA GPUDirect on DGX Spark."
 
     @classmethod
     def IS_CHANGED(cls, model_name, device):
-        # If model was unloaded (not in registry), return NaN to force re-execution.
-        # NaN != any cached value, so ComfyUI will re-run the loader.
-        if model_name not in _dgx_registry:
+        key = _registry_key("diffusion_models", model_name)
+        if key not in _dgx_registry:
             return float("nan")
-        return _dgx_registry[model_name]["load_id"]
+        return _dgx_registry[key]["load_id"]
 
     def load_model(self, model_name, device):
         global _load_counter
+        key = _registry_key("diffusion_models", model_name)
 
-        # If already loaded, return the existing model (avoids costly reload)
-        if model_name in _dgx_registry:
-            return (_dgx_registry[model_name]["model_patcher"],)
+        if key in _dgx_registry:
+            return (_dgx_registry[key]["objects"][0],)
 
         dev = torch.device(device)
         model_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         
-        # fastsafetensors
-        loader = SafeTensorsFileLoader(SingleGroup(), dev)
-        loader.add_filenames({0: [model_path]})
-        metadata = loader.meta[model_path][0].metadata
-        fb = loader.copy_files_to_device()
-        keys = list(fb.key_to_rank_lidx.keys())
-        sd = {} # state dictionary
-        for k in keys:
-            sd[k] = fb.get_tensor(k)
-        #fb.close() # No!
-        #loader.close() # No!
-        
+        sd, metadata, fb, loader = _fastsafe_load(model_path, device)
+
         # Init the model to pass to ComfyUI
         diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(sd)
         temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
         if len(temp_sd) > 0:
             sd = temp_sd
         model_config = comfy.model_detection.model_config_from_unet(sd, "", metadata=metadata)
-        if model_config == None:
+        if model_config is None:
             fb.close()
             loader.close()
-            raise RuntimeError("Couldn't load the model.")
+            raise RuntimeError("Couldn't detect model type.")
         model_dtype = comfy.utils.weight_dtype(sd, "")
         model_config.set_inference_dtype(model_dtype, torch.bfloat16)
         model = model_config.get_model(sd, "", device=None)
         
-        # Use this instead of load_model_weights()
-        # I think 'diffusion_model' is a subclass of torch.nn.Module,
-        # so we can use assign=True in load_state_dict which avoids
-        # a copy. Just make sure you don't free the tensors read
-        # by fastsafetensors if we use this option.
-        #
-        # The following duplicates the functionality of load_model_weights():
-        #
-        # Ensure stuff isn't duplicated on the GPU
         model = model.to(None)
-        #
         sd = model_config.process_unet_state_dict(sd)
-        # load_state_dict is from torch.nn.Module
-        # If using assign=True, then don't free the tensors
-        # loaded with fastsafetensors.
         model.diffusion_model.load_state_dict(sd, strict=False, assign=True)
         
-        model = comfy.model_patcher.ModelPatcher(model, load_device=dev, offload_device=None)
+        model_patcher = comfy.model_patcher.ModelPatcher(model, load_device=dev, offload_device=None)
 
-        # Track in registry for the unloader
         _load_counter += 1
-        _dgx_registry[model_name] = {
+        _dgx_registry[key] = {
             "fb": fb,
             "loader": loader,
-            "model_patcher": model,
+            "objects": [model_patcher],
             "load_id": _load_counter,
         }
 
-        return (model,)
+        return (model_patcher,)
 
+
+class DGXSparkCheckpointLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {
+                    "tooltip": "The name of the checkpoint to load.",
+                }),
+                "device": (["cuda:0"], {
+                    "default": "cuda:0",
+                    "tooltip": "The device to load to.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
+    FUNCTION = "load_checkpoint"
+    CATEGORY = "loaders"
+    DESCRIPTION = "Loads a checkpoint .safetensors file (model + CLIP + VAE) using NVIDIA GPUDirect on DGX Spark."
+
+    @classmethod
+    def IS_CHANGED(cls, ckpt_name, device):
+        key = _registry_key("checkpoints", ckpt_name)
+        if key not in _dgx_registry:
+            return float("nan")
+        return _dgx_registry[key]["load_id"]
+
+    def load_checkpoint(self, ckpt_name, device):
+        global _load_counter
+        key = _registry_key("checkpoints", ckpt_name)
+
+        if key in _dgx_registry:
+            cached = _dgx_registry[key]["outputs"]
+            return cached
+
+        ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        sd, metadata, fb, loader = _fastsafe_load(ckpt_path, device)
+
+        # Use ComfyUI's own config guesser which splits sd into model/clip/vae
+        out = comfy.sd.load_state_dict_guess_config(
+            sd,
+            output_vae=True,
+            output_clip=True,
+            output_clipvision=False,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            output_model=True,
+            metadata=metadata,
+        )
+        if out is None:
+            fb.close()
+            loader.close()
+            raise RuntimeError(f"Could not detect model type of: {ckpt_path}")
+
+        model_patcher, clip, vae, _clipvision = out
+
+        # Track all patcher objects for cleanup
+        tracked = []
+        if model_patcher is not None:
+            tracked.append(model_patcher)
+        if clip is not None:
+            tracked.append(clip.patcher)
+        if vae is not None:
+            tracked.append(vae.patcher)
+
+        _load_counter += 1
+        _dgx_registry[key] = {
+            "fb": fb,
+            "loader": loader,
+            "objects": tracked,
+            "outputs": (model_patcher, clip, vae),
+            "load_id": _load_counter,
+        }
+
+        return (model_patcher, clip, vae)
+
+
+class DGXSparkCLIPLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip_name": (folder_paths.get_filename_list("text_encoders"), {
+                    "tooltip": "The CLIP / text encoder model to load.",
+                }),
+                "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio",
+                          "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan",
+                          "hidream", "chroma", "ace", "omnigen2", "qwen_image",
+                          "hunyuan_image", "flux2", "ovis", "longcat_image"], ),
+                "device": (["cuda:0"], {
+                    "default": "cuda:0",
+                    "tooltip": "The device to load to. On DGX Spark, always use cuda:0 (unified memory).",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("CLIP",)
+    RETURN_NAMES = ("clip",)
+    FUNCTION = "load_clip"
+    CATEGORY = "loaders"
+    DESCRIPTION = "Loads a CLIP / text encoder .safetensors file using NVIDIA GPUDirect on DGX Spark."
+
+    @classmethod
+    def IS_CHANGED(cls, clip_name, type, device):
+        key = _registry_key("text_encoders", clip_name)
+        if key not in _dgx_registry:
+            return float("nan")
+        return _dgx_registry[key]["load_id"]
+
+    def load_clip(self, clip_name, type="stable_diffusion", device="cuda:0"):
+        global _load_counter
+        key = _registry_key("text_encoders", clip_name)
+
+        if key in _dgx_registry:
+            return (_dgx_registry[key]["outputs"][0],)
+
+        clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
+        sd, metadata, fb, loader = _fastsafe_load(clip_path, device)
+
+        # Convert old quant formats
+        sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
+
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+        clip = comfy.sd.load_text_encoder_state_dicts(
+            state_dicts=[sd],
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            clip_type=clip_type,
+        )
+
+        _load_counter += 1
+        _dgx_registry[key] = {
+            "fb": fb,
+            "loader": loader,
+            "objects": [clip.patcher],
+            "outputs": (clip,),
+            "load_id": _load_counter,
+        }
+
+        return (clip,)
+
+
+class DGXSparkVAELoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae_name": (folder_paths.get_filename_list("vae"), {
+                    "tooltip": "The VAE model to load.",
+                }),
+                "device": (["cuda:0"], {
+                    "default": "cuda:0",
+                    "tooltip": "The device to load to.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("VAE",)
+    RETURN_NAMES = ("vae",)
+    FUNCTION = "load_vae"
+    CATEGORY = "loaders"
+    DESCRIPTION = "Loads a VAE .safetensors file using NVIDIA GPUDirect on DGX Spark."
+
+    @classmethod
+    def IS_CHANGED(cls, vae_name, device):
+        key = _registry_key("vae", vae_name)
+        if key not in _dgx_registry:
+            return float("nan")
+        return _dgx_registry[key]["load_id"]
+
+    def load_vae(self, vae_name, device="cuda:0"):
+        global _load_counter
+        key = _registry_key("vae", vae_name)
+
+        if key in _dgx_registry:
+            return (_dgx_registry[key]["outputs"][0],)
+
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+        sd, metadata, fb, loader = _fastsafe_load(vae_path, device)
+
+        vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+        vae.throw_exception_if_invalid()
+
+        _load_counter += 1
+        _dgx_registry[key] = {
+            "fb": fb,
+            "loader": loader,
+            "objects": [vae.patcher],
+            "outputs": (vae,),
+            "load_id": _load_counter,
+        }
+
+        return (vae,)
+
+
+# ===================================================================
+#  Unloader node
+# ===================================================================
 
 class DGXSparkUnloader:
-    """Companion node to DGXSparkSafetensorsLoader.
-    Frees all GPU/RAM memory held by a model loaded via the DGX Spark loader.
-    After unloading, re-queue the workflow to reload the model automatically.
-
+    """Frees GPU/RAM memory for models loaded by any DGX Spark loader node.
     Set 'confirm' to True and queue the workflow (or click play) to unload.
-    The node is a safe no-op when confirm is False, so normal workflow runs
-    won't accidentally unload your models."""
+    Safe no-op when confirm is False."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -191,10 +409,15 @@ class DGXSparkUnloader:
                 }),
                 "mode": (["selected", "all"], {
                     "default": "selected",
-                    "tooltip": "'selected' unloads only the chosen model. 'all' unloads every model loaded by the DGX Spark loader.",
+                    "tooltip": "'selected' unloads only the chosen model. 'all' unloads every model loaded by any DGX Spark loader.",
                 }),
-                "model_name": (folder_paths.get_filename_list("diffusion_models"), {
-                    "tooltip": "The model to unload (only used when mode is 'selected').",
+                "category": (["diffusion_models", "checkpoints", "text_encoders", "vae"], {
+                    "default": "diffusion_models",
+                    "tooltip": "The category of the model to unload (only used when mode is 'selected').",
+                }),
+                "model_name": ("STRING", {
+                    "default": "",
+                    "tooltip": "Exact filename of the model to unload (only used when mode is 'selected'). Must match the name used when loading.",
                 }),
             }
         }
@@ -203,30 +426,30 @@ class DGXSparkUnloader:
     FUNCTION = "unload_model"
     OUTPUT_NODE = True
     CATEGORY = "loaders"
-    DESCRIPTION = "Frees GPU/RAM memory for models loaded by the DGX Spark Loader. Set 'confirm' to True and queue to trigger. Safe no-op when confirm is False."
+    DESCRIPTION = "Frees GPU/RAM memory for models loaded by DGX Spark loaders. Set 'confirm' to True and queue to trigger. Safe no-op when confirm is False."
 
     @classmethod
-    def IS_CHANGED(cls, mode, model_name, confirm):
+    def IS_CHANGED(cls, confirm, mode, category, model_name):
         if not confirm:
             return False
-        # Always re-execute when confirm is True so the unload actually runs
         return float("nan")
 
-    def unload_model(self, mode, model_name, confirm):
+    def unload_model(self, confirm, mode, category, model_name):
         if not confirm:
             return {"ui": {"text": ["Skipped (confirm is False)"]}}
 
         if mode == "all":
             names = list(_dgx_registry.keys())
             if not names:
-                return {"ui": {"text": ["No models loaded via DGX Spark loader."]}}
-            for name in names:
-                _cleanup_model(name)
+                return {"ui": {"text": ["No models loaded via DGX Spark loaders."]}}
+            for k in names:
+                _cleanup_model(k)
             return {"ui": {"text": [f"Unloaded {len(names)} model(s): {', '.join(names)}"]}}
 
         # mode == "selected"
-        if model_name in _dgx_registry:
-            _cleanup_model(model_name)
-            return {"ui": {"text": [f"Unloaded: {model_name}"]}}
-        return {"ui": {"text": [f"Not loaded via DGX Spark loader: {model_name}"]}}
+        key = _registry_key(category, model_name)
+        if key in _dgx_registry:
+            _cleanup_model(key)
+            return {"ui": {"text": [f"Unloaded: {key}"]}}
+        return {"ui": {"text": [f"Not loaded: {key}"]}}
 

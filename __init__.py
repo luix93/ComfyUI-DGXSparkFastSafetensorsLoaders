@@ -5,10 +5,16 @@ from .nodes import *
 
 NODE_CLASS_MAPPINGS = {
 	"DGXSparkSafetensorsLoader": DGXSparkSafetensorsLoader,
+	"DGXSparkCheckpointLoader": DGXSparkCheckpointLoader,
+	"DGXSparkCLIPLoader": DGXSparkCLIPLoader,
+	"DGXSparkVAELoader": DGXSparkVAELoader,
 	"DGXSparkUnloader": DGXSparkUnloader,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
 	"DGXSparkSafetensorsLoader": "DGX Spark Safetensors Loader",
+	"DGXSparkCheckpointLoader": "DGX Spark Checkpoint Loader",
+	"DGXSparkCLIPLoader": "DGX Spark CLIP Loader",
+	"DGXSparkVAELoader": "DGX Spark VAE Loader",
 	"DGXSparkUnloader": "DGX Spark Model Unloader",
 }
 
