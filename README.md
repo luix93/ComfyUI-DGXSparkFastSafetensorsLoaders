@@ -47,6 +47,10 @@ Restart ComfyUI. The nodes appear in the **loaders** category.
 
 - Tested with `--disable-mmap` and `--gpu-only` flags, though they might be unnecessary.
 
+## Known Issues
+
+- All loaders except Safetensor Loader will double the memory usage. But they do significantly reduce the model loading time.
+
 ## Acknowledgements
 
 Original node by [Phaserblast](https://github.com/phaserblast) — [ComfyUI-DGXSparkSafetensorsLoader](https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader), licensed under the Apache License 2.0.
