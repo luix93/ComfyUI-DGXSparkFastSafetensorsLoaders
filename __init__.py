@@ -9,6 +9,7 @@ NODE_CLASS_MAPPINGS = {
 	"DGXSparkCLIPLoader": DGXSparkCLIPLoader,
 	"DGXSparkVAELoader": DGXSparkVAELoader,
 	"DGXSparkDualCLIPLoader": DGXSparkDualCLIPLoader,
+	"DGXSparkLatentUpscaleModelLoader": DGXSparkLatentUpscaleModelLoader,
 	"DGXSparkUnloader": DGXSparkUnloader,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -17,5 +18,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 	"DGXSparkCLIPLoader": "DGX Spark CLIP Loader",
 	"DGXSparkVAELoader": "DGX Spark VAE Loader",
 	"DGXSparkDualCLIPLoader": "DGX Spark Dual CLIP Loader",
+	"DGXSparkLatentUpscaleModelLoader": "DGX Spark Latent Upscale Model Loader",
 	"DGXSparkUnloader": "DGX Spark Model Unloader",
 }

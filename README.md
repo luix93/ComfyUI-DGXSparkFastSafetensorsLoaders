@@ -17,6 +17,7 @@ In my workflows with Qwen Image Edit, it reduces loading time to ~5s total.
 | **DGX Spark CLIP Loader** | Loads a CLIP / text encoder from `text_encoders/` |
 | **DGX Spark Dual CLIP Loader** | Loads and combines two text encoders like ComfyUI's built-in Dual CLIP Loader |
 | **DGX Spark VAE Loader** | Loads a VAE from `vae/` and also supports `vae_approx`, TAESD variants, `pixel_space`, and audio VAEs |
+| **DGX Spark Latent Upscale Model Loader** | Loads models from `latent_upscale_models/` for ComfyUI latent upscaler workflows |
 | **DGX Spark Model Unloader** | Explicitly frees fastsafetensors GPU memory for a loaded model |
 
 All loader nodes cache loaded models in a global registry so re-running a workflow does not reload the file from disk. The **DGX Spark Model Unloader** node allows explicit VRAM reclamation without restarting ComfyUI. This addresses the memory-management limitation present in the original implementation.
@@ -25,7 +26,7 @@ All loader nodes cache loaded models in a global registry so re-running a workfl
 
 ![nodes](images/image.png)
 
-`Safetensors Loader`, `Checkpoints Loader`, `CLIP Loader`, `Dual CLIP Loader` and `VAE Loader` behave similarly to their official counterparts, except that their memory are not managed by ComfyUI. Thus, you can directly replace the original loader(s) in your workflow with them as needed.
+`Safetensors Loader`, `Checkpoints Loader`, `CLIP Loader`, `Dual CLIP Loader`, `VAE Loader`, and `Latent Upscale Model Loader` behave similarly to their official counterparts, except that their memory are not managed by ComfyUI. Thus, you can directly replace the original loader(s) in your workflow with them as needed.
 
 The VAE loader also covers the extra behaviors commonly used from `VAE Loader KJ`: `vae_approx` video TAEs, TAESD image VAEs, `pixel_space`, selectable VAE dtype, and Lightricks audio VAE checkpoints.
 

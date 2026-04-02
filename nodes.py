@@ -9,6 +9,7 @@
 # https://github.com/redstonewhite/ComfyUI-DGXSparkFastSafetensorsLoaders
 
 import gc
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -46,7 +47,16 @@ def _fastsafe_load(file_path, device):
     sd = {}
     for k in fb.key_to_rank_lidx.keys():
         sd[k] = fb.get_tensor(k)
+    _move_tokenizer_tensors_to_cpu(sd)
     return sd, metadata, fb, loader
+
+
+def _move_tokenizer_tensors_to_cpu(sd):
+    for key, value in list(sd.items()):
+        if not torch.is_tensor(value):
+            continue
+        if key.endswith("spiece_model") or key.endswith("tekken_model"):
+            sd[key] = value.detach().cpu()
 
 
 def _resolve_device(device):
@@ -146,22 +156,28 @@ def _cleanup_model(key):
             if hasattr(obj, "named_parameters"):
                 _clear_nn_params(obj)
             continue
+        cleared = False
         # Diffusion model (UNet / DiT)
         dm = getattr(model, "diffusion_model", None)
         if dm is not None:
             _clear_nn_params(dm)
+            cleared = True
         # CLIP text encoder
         csm = getattr(obj, "cond_stage_model", None)
         if csm is None:
             csm = model  # the patcher.model could be the TE itself
         if csm is not None and hasattr(csm, "named_parameters"):
             _clear_nn_params(csm)
+            cleared = True
         # VAE
         fsm = getattr(model, "first_stage_model", None) or getattr(
             obj, "first_stage_model", None
         )
         if fsm is not None:
             _clear_nn_params(fsm)
+            cleared = True
+        if not cleared and hasattr(model, "named_parameters"):
+            _clear_nn_params(model)
 
     # 3. Release fastsafetensors GPU memory
     handles = list(entry.get("handles", []))
@@ -760,6 +776,133 @@ class DGXSparkDualCLIPLoader:
         }
 
         return (clip,)
+
+
+class DGXSparkLatentUpscaleModelLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_name": (
+                    folder_paths.get_filename_list("latent_upscale_models"),
+                    {
+                        "tooltip": "The latent upscale model to load.",
+                    },
+                ),
+                "device": (
+                    ["cuda:0", "main_device", "cpu"],
+                    {
+                        "default": "cuda:0",
+                        "tooltip": "The device to load to.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT_UPSCALE_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_model"
+    CATEGORY = "loaders"
+    DESCRIPTION = "Loads a latent upscale model using NVIDIA GPUDirect on DGX Spark when the checkpoint format supports it."
+
+    @classmethod
+    def IS_CHANGED(cls, model_name, device):
+        key = _registry_key("latent_upscale_models", f"{model_name}|{device}")
+        if key not in _dgx_registry:
+            return float("nan")
+        return _dgx_registry[key]["load_id"]
+
+    def load_model(self, model_name, device="cuda:0"):
+        global _load_counter
+        key = _registry_key("latent_upscale_models", f"{model_name}|{device}")
+
+        if key in _dgx_registry:
+            return (_dgx_registry[key]["outputs"][0],)
+
+        dev = _resolve_device(device)
+        model_path = folder_paths.get_full_path_or_raise(
+            "latent_upscale_models", model_name
+        )
+        sd, metadata, fb, loader = _load_torch_or_fastsafe(model_path, dev)
+        tracked_objects = []
+
+        if "blocks.0.block.0.conv.weight" in sd:
+            from comfy.ldm.hunyuan_video.upsampler import HunyuanVideo15SRModel
+
+            config = {
+                "in_channels": sd["in_conv.conv.weight"].shape[1],
+                "out_channels": sd["out_conv.conv.weight"].shape[0],
+                "hidden_channels": sd["in_conv.conv.weight"].shape[0],
+                "num_blocks": len(
+                    [
+                        k
+                        for k in sd.keys()
+                        if k.startswith("blocks.")
+                        and k.endswith(".block.0.conv.weight")
+                    ]
+                ),
+                "global_residual": False,
+            }
+            with _force_assign_true():
+                model = HunyuanVideo15SRModel("720p", config)
+                model.load_sd(sd)
+            _fix_patcher_for_dgx(model.patcher, dev)
+            tracked_objects = [model.patcher]
+        elif "up.0.block.0.conv1.conv.weight" in sd:
+            from comfy.ldm.hunyuan_video.upsampler import HunyuanVideo15SRModel
+
+            sd = {
+                key.replace("nin_shortcut", "nin_shortcut.conv", 1): value
+                for key, value in sd.items()
+            }
+            block_count = len(
+                [
+                    k
+                    for k in sd.keys()
+                    if k.startswith("up.") and k.endswith(".block.0.conv1.conv.weight")
+                ]
+            )
+            config = {
+                "z_channels": sd["conv_in.conv.weight"].shape[1],
+                "out_channels": sd["conv_out.conv.weight"].shape[0],
+                "block_out_channels": tuple(
+                    sd[f"up.{i}.block.0.conv1.conv.weight"].shape[0]
+                    for i in range(block_count)
+                ),
+            }
+            with _force_assign_true():
+                model = HunyuanVideo15SRModel("1080p", config)
+                model.load_sd(sd)
+            _fix_patcher_for_dgx(model.patcher, dev)
+            tracked_objects = [model.patcher]
+        elif "post_upsample_res_blocks.0.conv2.bias" in sd:
+            from comfy.ldm.lightricks.latent_upsampler import LatentUpsampler
+
+            config = json.loads(metadata["config"])
+            dtype = comfy.model_management.vae_dtype(
+                dev, allowed_dtypes=[torch.bfloat16, torch.float32]
+            )
+            model = LatentUpsampler.from_config(config).to(device=dev, dtype=dtype)
+            model.load_state_dict(sd, assign=True)
+            tracked_objects = [model]
+        else:
+            if fb is not None:
+                fb.close()
+            if loader is not None:
+                loader.close()
+            raise RuntimeError(f"Unsupported latent upscale model format: {model_name}")
+
+        handles = [h for h in (fb, loader) if h is not None]
+
+        _load_counter += 1
+        _dgx_registry[key] = {
+            "handles": handles,
+            "objects": tracked_objects,
+            "outputs": (model,),
+            "load_id": _load_counter,
+        }
+
+        return (model,)
 
 
 # ===================================================================
